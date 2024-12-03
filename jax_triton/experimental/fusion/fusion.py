@@ -17,13 +17,12 @@ import dataclasses
 import functools
 import os
 
-from typing import Any, Tuple
+from typing import Any
 
 import jax
 from jax import lax
 from jax.extend import linear_util as lu
 from jax.interpreters import partial_eval as pe
-from jax.interpreters import xla
 from jax._src import core
 from jax._src import util
 from jax._src.lax.control_flow import for_loop
@@ -205,7 +204,7 @@ def make_elementwise(shape, dtype, *args):
 class MatmulElementwise(jax_rewrite.JaxExpression):
   x: jax_rewrite.JaxExpression
   y: jax_rewrite.JaxExpression
-  elem_ops: Tuple[core.Primitive]
+  elem_ops: tuple[core.Primitive]
 
   def match(self, expr, bindings, succeed):
     if not isinstance(expr, MatmulElementwise):
@@ -251,6 +250,7 @@ def _matmul_elementwise_lowering_rule(x, y, *args, left_ops, right_ops, out_ops,
     bias, = args
   else:
     bias = None
+  del bias  # TODO(sharadmv): Please fix or remove `bias` above.
   lhs_dim, rhs_dim = contract_dims
   M, N, K = x.shape[1 - lhs_dim], y.shape[1 - rhs_dim], x.shape[lhs_dim]
   assert x.shape[lhs_dim] == y.shape[rhs_dim]
@@ -340,4 +340,3 @@ def _dot_general_lowering_rule(x, y, dimension_numbers, **_):
                                            out_ops=[], contract_dims=(lhs_dim,
                                                                       rhs_dim))
 lowering_rules[lax.dot_general_p] = _dot_general_lowering_rule
-

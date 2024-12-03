@@ -14,17 +14,18 @@
 
 """Module for calling Triton kernels from JAX."""
 
-# b/301982023
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 import copy
 import dataclasses
 import functools
+import inspect
 import os
 import pprint
 import tempfile
 import types
-from typing import Any, Callable, Dict, Optional, Protocol, Sequence, Tuple, Union
+from typing import Any, Protocol, Union
 import zlib
 
 from absl import logging
@@ -41,6 +42,7 @@ from jax.interpreters import xla
 import jax.numpy as jnp
 import numpy as np
 
+
 CAN_USE_TRITON = False
 try:
   import triton
@@ -49,12 +51,19 @@ try:
   import triton.language as tl
   from triton.runtime import autotuner
   import triton._C.libtriton as _triton
-  from triton._C.libtriton import ir as tl_ir
   import triton.backends.nvidia.compiler as cb
 
   CAN_USE_TRITON = True
 except ModuleNotFoundError:
   pass
+
+try:
+  import triton.backends.amd.compiler as hb
+except ImportError:
+  hb = None
+  pass
+
+
 try:
   from jax._src.lib import gpu_triton as triton_kernel_call_lib
 except ImportError:
@@ -76,7 +85,10 @@ _JAX_TO_TRITON_TYPE_MAP = {
     jnp.dtype("float64"): "fp64",
     jnp.dtype("float32"): "fp32",
     jnp.dtype("float16"): "fp16",
-    # Triton has 'fp8' as well which Jax doesn't support yet.
+    jnp.dtype("float8_e4m3fn"): "fp8e4nv",
+    jnp.dtype("float8_e5m2"): "fp8e5",
+    jnp.dtype("float8_e4m3fnuz"): "fp8e4b8",
+    jnp.dtype("float8_e5m2fnuz"): "fp8e5b16",
     jnp.dtype("int64"): "i64",
     jnp.dtype("int32"): "i32",
     jnp.dtype("int16"): "i16",
@@ -89,12 +101,11 @@ _JAX_TO_TRITON_TYPE_MAP = {
     jnp.dtype("bool"): "B",
 }
 
+Grid = Union[int, tuple[int], tuple[int, int], tuple[int, int, int]]
+GridOrLambda = Union[Grid, Callable[[dict[str, Any]], Grid]]
 
-Grid = Union[int, Tuple[int], Tuple[int, int], Tuple[int, int, int]]
-GridOrLambda = Union[Grid, Callable[[Dict[str, Any]], Grid]]
 
-
-def normalize_grid(grid: GridOrLambda, metaparams) -> Tuple[int, int, int]:
+def normalize_grid(grid: GridOrLambda, metaparams) -> tuple[int, int, int]:
   if callable(grid):
     grid = grid(metaparams)
   if isinstance(grid, int):
@@ -156,14 +167,53 @@ def aval_size_bytes(aval):
   return np.dtype(aval.dtype).itemsize * aval.size
 
 
+def get_cuda_backend(device, compute_capability):
+  target = cb.GPUTarget('cuda', compute_capability, 32)
+  backend = cb.CUDABackend(target)
+  return backend
+
+def get_hip_backend(device, compute_capability):
+  arch = triton_kernel_call_lib.get_arch_details(device)
+  arch = arch.split(":")[0]
+  target = hb.GPUTarget('hip', arch, 64)
+  backend = hb.HIPBackend(target)
+  return backend
+
 @dataclasses.dataclass
-class PtxCompilationResult:
-  ptx: str
+class CompilationResult:
+  binary: str
   name: str
   shared_mem_bytes: int
   cluster_dims: tuple
-  ttgir: Optional[str]
-  llir: Optional[str]
+  ttgir: str | None
+  llir: str | None
+
+def compile_ttir_inplace(
+    ttir,
+    backend: [cb.CUDABackend | hb.HIPBackend],
+    options: [cb.CUDAOptions | hb.HIPOptions],
+    compute_capability,
+    platform
+):
+  if platform == 'cuda':
+    return compile_ttir_to_ptx_inplace(
+          ttir,
+          backend,
+          options,
+          compute_capability,
+    )
+
+  elif platform == 'rocm':
+    return compile_ttir_to_hsaco_inplace(
+          ttir,
+          backend,
+          options,
+          compute_capability,
+    )
+  else:
+    raise ValueError(
+      "Unsupported device."
+    )
 
 
 def compile_ttir_to_ptx_inplace(
@@ -171,24 +221,11 @@ def compile_ttir_to_ptx_inplace(
     cuda_backend: cb.CUDABackend,
     cuda_options: cb.CUDAOptions,
     compute_capability,
-) -> PtxCompilationResult:
+) -> CompilationResult:
   if cuda_options.debug:
     print(ttir)
-  if isinstance(ttir, ir.Module):
-    context = _triton.ir.context()
-    _triton.ir.load_dialects(context)
-    cuda_backend.load_dialects(context)
-
-    # Triton compilation APIs only accept Triton-specific MLIR wrappers.
-    # So, here we serialize an ir.Module to a file and then deserialize
-    # it as a tl_ir.module.
-    with tempfile.NamedTemporaryFile(mode="wb") as f:
-      ttir.operation.write_bytecode(f)
-      f.flush()
-      ttir = tl_ir.parse_mlir_module(f.name, context)
-    ttir.context = context
   try:
-    metadata = dict()
+    metadata = {}
     opt_ttir = cuda_backend.make_ttir(ttir, metadata, cuda_options)
     ttgir = cuda_backend.make_ttgir(
         opt_ttir,
@@ -226,8 +263,8 @@ def compile_ttir_to_ptx_inplace(
   cluster_dims = metadata["cluster_dims"]
   ttgir = str(ttgir) if _JAX_TRITON_DUMP_DIR else None
   llir = str(llir) if _JAX_TRITON_DUMP_DIR else None
-  return PtxCompilationResult(
-      ptx=ptx,
+  return CompilationResult(
+      binary=ptx,
       name=name,
       shared_mem_bytes=shared_mem_bytes,
       cluster_dims=cluster_dims,
@@ -235,11 +272,71 @@ def compile_ttir_to_ptx_inplace(
       llir=llir,
   )
 
+def compile_ttir_to_hsaco_inplace(
+    ttir,
+    hip_backend: hb.HIPBackend,
+    hip_options: hb.HIPOptions,
+    compute_capability,
+) -> CompilationResult:
+  if hip_options.debug:
+    print(ttir)
+  try:
+    metadata = {}
+    opt_ttir = hip_backend.make_ttir(ttir, metadata, hip_options)
+    ttgir = hip_backend.make_ttgir(
+        opt_ttir,
+        metadata,
+        hip_options
+    )
+  except RuntimeError as e:
+    ttir.dump()
+    raise ValueError("TTIR->TTGIR pass failed!") from e
+  if hip_options.debug:
+    print(ttgir)
+  try:
+    llir = hip_backend.make_llir(
+        ttgir,
+        metadata,
+        hip_options
+    )
+  except RuntimeError as e:
+    ttgir.dump()
+    raise ValueError("TTGIR->LLIR pass failed!") from e
+  shared_mem_bytes = metadata["shared"]
+  if hip_options.debug:
+    print(llir)
+
+  amdgcn = hip_backend.make_amdgcn(llir, metadata, hip_options)
+  hsaco = hip_backend.make_hsaco(amdgcn, metadata, hip_options)
+
+  name = metadata["name"]
+  ttgir = str(ttgir) if _JAX_TRITON_DUMP_DIR else None
+  llir = str(llir) if _JAX_TRITON_DUMP_DIR else None
+  # cluster dims are NOT useful on hip backend.
+  # We just fill up with some value for API compatibility
+  cluster_dims = (0, 0, 0)
+  # Instead of passing hsaco which are "bytes", we first write
+  # to a file and then pass the "string" path. This is needed because
+  # nanobind doesn't automatically convert between bytes and string.
+  # https://github.com/wjakob/nanobind/discussions/137
+  fd, hsaco_path = tempfile.mkstemp()
+  with os.fdopen(fd, "wb") as f:
+    f.write(hsaco)
+  return CompilationResult(
+      binary=hsaco_path,
+      name=name,
+      shared_mem_bytes=shared_mem_bytes,
+      cluster_dims=cluster_dims,
+      ttgir=ttgir,
+      llir=llir,
+  )
 
 _COMPILED_KERNEL_CACHE = {}  # TODO(cjfj): Convert to LRU cache?
 
 
 def get_or_create_triton_kernel(
+    backend_init_func,
+    platform,
     fn,
     arg_dtypes,
     scalar_args,
@@ -251,21 +348,21 @@ def get_or_create_triton_kernel(
     enable_fp_fusion,
     metaparams,
     dump: bool,
-) -> Tuple[triton_kernel_call_lib.TritonKernel, Any]:
+) -> tuple[triton_kernel_call_lib.TritonKernel, Any]:
   if num_warps is None:
     num_warps = 4
   if num_stages is None:
     num_stages = 3
+  # TODO(sharadmv): handle multiple devices, right now we assume device 0
+  # which is fine when we have multiple of the same GPU but this won't work in
+  # general.
+  device = 0
   if compute_capability is None:
-    # TODO(sharadmv): handle multiple devices, right now we assume device 0
-    # which is fine when we have multiple of the same GPU but this won't work in
-    # general.
-    device = 0
     compute_capability = triton_kernel_call_lib.get_compute_capability(device)
   if num_ctas > 1 and compute_capability < 90:
     raise ValueError("num_ctas > 1 unsupported before Hopper.")
 
-  signature = dict(enumerate(arg_dtypes))
+  signature = {fn.arg_names[i]: v for i, v in enumerate(arg_dtypes)}
   # TODO(sharadmv,zhangqiaorjc): handle differently aligned pointers
   # We assume that all arrays are aligned to 16 bytes, and Triton may use this
   # assumption, unless array args are include in the `do_not_specialize` list.
@@ -273,19 +370,20 @@ def get_or_create_triton_kernel(
   # `JITFunction._get_config` to get the specialization_attr.
   mock_torch_tensor = types.SimpleNamespace(data_ptr=lambda: 16)
   args_for_specialization_attr = [mock_torch_tensor] * len(arg_dtypes)
+  backend = backend_init_func(device, compute_capability)
   for i, _, v in scalar_args:
     args_for_specialization_attr[i] = v
-  specialization_attr = fn._get_config(*args_for_specialization_attr)  # pylint: disable=protected-access
 
-  constants = {fn.arg_names.index(k): v for k, v in metaparams.items()}
-  constants.update({i: None for i, _, v in scalar_args if v is None})
-  constants.update({i: 1 for i in specialization_attr.equal_to_1})
+  specialization_attr = backend.get_attrs_descriptor(fn.params[:len(args_for_specialization_attr)], args_for_specialization_attr)  # pylint: disable=protected-access
+  constants = dict(metaparams)
+  constants.update({k: None for _, k, v in scalar_args if v is None})
+  constants.update({fn.arg_names[i]: 1 for i in specialization_attr.equal_to_1})
 
   # Cache key should contain any parameter that can affect the compiler output.
   cache_key = (
       fn,
       tuple(signature.items()),
-      tuple(vars(specialization_attr).values()),
+      tuple(specialization_attr.get_fn_attrs()),
       tuple(constants.items()),
       num_warps,
       num_stages,
@@ -296,50 +394,69 @@ def get_or_create_triton_kernel(
   kernel = _COMPILED_KERNEL_CACHE.get(cache_key)
 
   if kernel is None:
-    target = ("cuda", compute_capability)
-    cuda_backend = cb.CUDABackend(target)
-    cuda_options = cuda_backend.parse_options(
-        dict(
-            num_warps=num_warps,
-            num_stages=num_stages,
-            num_ctas=num_ctas,
-            optimize_epilogue=False,
-            debug=dump,
-            enable_fp_fusion=enable_fp_fusion,
-        )
-    )
+    opts = {
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "num_ctas": num_ctas,
+        "optimize_epilogue": False,
+        "debug": dump,
+        "enable_fp_fusion": enable_fp_fusion,
+    }
+
+    options = backend.parse_options(opts)
+
     kernel_hash = abs(hash(cache_key))
     if _JAX_TRITON_DUMP_DIR:
       os.makedirs(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}")
       with open(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/config", "w") as f:
         pprint.pprint(cache_key, stream=f)
-        pprint.pprint(cuda_options, stream=f)
+        pprint.pprint(options, stream=f)
 
     context = _triton.ir.context()
     _triton.ir.load_dialects(context)
-    cuda_backend.load_dialects(context)
-    codegen_fns = cuda_backend.get_codegen_implementation()
+    backend.load_dialects(context)
+    codegen_fns = backend.get_codegen_implementation()
 
-    module = code_gen.ast_to_ttir(
-        fn,
-        specialization=tc.ASTSource(
+    module = (
+        code_gen.ast_to_ttir(
             fn,
-            constants=constants,
-            signature=signature,
-            attrs=specialization_attr,
-        ),
-        options=cuda_options,
-        codegen_fns=codegen_fns,
-        context=context,
+            specialization=tc.ASTSource(
+              fn,
+               constants=constants,
+               signature=signature,
+               attrs=specialization_attr,
+             ),
+            options=options,
+            codegen_fns=codegen_fns,
+            context=context,
+            module_map=backend.get_module_map(),
+        )
+        if "module_map" in inspect.getfullargspec(code_gen.ast_to_ttir).args
+        # Triton changes ASTSource.ast_to_ttir to include module_map. Handle
+        # backward compatibility here.
+        else code_gen.ast_to_ttir(
+            fn,
+            specialization=tc.ASTSource(
+              fn,
+               constants=constants,
+               signature=signature,
+               attrs=specialization_attr,
+             ),
+            options=options,
+            codegen_fns=codegen_fns,
+            context=context,
+        )
     )
     ttir = str(module)
 
-    compilation_result = compile_ttir_to_ptx_inplace(
-        module,
-        cuda_backend,
-        cuda_options,
-        compute_capability,
+    compilation_result = compile_ttir_inplace(
+      module,
+      backend,
+      options,
+      compute_capability,
+      platform
     )
+
     kernel_name = compilation_result.name
     if _JAX_TRITON_DUMP_DIR:
       with open(
@@ -372,7 +489,7 @@ def get_or_create_triton_kernel(
         kernel_name,
         num_warps,
         compilation_result.shared_mem_bytes,
-        compilation_result.ptx,
+        compilation_result.binary,
         ttir,
         compute_capability,
         *compilation_result.cluster_dims,
@@ -384,6 +501,7 @@ def get_or_create_triton_kernel(
 
 
 def triton_kernel_call_lowering(
+    backend_init_func,
     ctx,
     *array_args,
     fn,
@@ -419,7 +537,11 @@ def triton_kernel_call_lowering(
   named_args = dict(unsafe_zip(fn.arg_names, args))
 
   if isinstance(fn, autotuner.Autotuner):
-    if any(idx not in fn.key_idx for idx, _, _ in scalar_args):
+    if hasattr(fn, "key_idx"):
+      key_idxs = fn.key_idx  # Triton <=3.2
+    else:
+      key_idxs = [fn.arg_names.index(k) for k in fn.keys]
+    if any(idx not in key_idxs for idx, _, _ in scalar_args):
       logging.warning(
           "Auto-tuning key does not include all scalar arguments. "
           "We may perform redundant auto-tuning."
@@ -502,6 +624,8 @@ def triton_kernel_call_lowering(
   kernel_calls = []
   for params in config_params:
     kernel, specialization_attr = get_or_create_triton_kernel(
+        backend_init_func,
+        ctx.module_context.platforms[0],
         fn,
         arg_dtypes,
         scalar_args,
@@ -521,7 +645,7 @@ def triton_kernel_call_lowering(
         kernel_params.append(
             triton_kernel_call_lib.create_array_parameter(
                 zeroed_params_with_sizes.get(i, 0),
-                16 if (i in specialization_attr.divisible_by_16) else 0,
+                16 if (i in specialization_attr.divisibility_16) else 0,
             )
         )
       elif i not in specialization_attr.equal_to_1:
@@ -571,14 +695,22 @@ def triton_kernel_call_lowering(
       operand_output_aliases=dict(input_output_aliases),
   ).results
 
+mlir.register_lowering(
+    triton_kernel_call_p,
+    functools.partial(triton_kernel_call_lowering, get_cuda_backend),
+    platform="cuda",
+)
 
-mlir.register_lowering(triton_kernel_call_p, triton_kernel_call_lowering)
-
+mlir.register_lowering(
+    triton_kernel_call_p,
+    functools.partial(triton_kernel_call_lowering, get_hip_backend),
+    platform="rocm",
+)
 
 class ShapeDtype(Protocol):
 
   @property
-  def shape(self) -> Tuple[int, ...]:
+  def shape(self) -> tuple[int, ...]:
     ...
 
   @property
@@ -587,21 +719,21 @@ class ShapeDtype(Protocol):
 
 
 def triton_call(
-    *args: Union[jax.Array, bool, int, float, np.float32],
+    *args: jax.Array | bool | int | float | np.float32,
     kernel: triton.JITFunction,
-    out_shape: Union[ShapeDtype, Sequence[ShapeDtype]],
+    out_shape: ShapeDtype | Sequence[ShapeDtype],
     grid: GridOrLambda,
     name: str = "",
     custom_call_target_name: str = "triton_kernel_call",
-    num_warps: Optional[int] = None,
-    num_stages: Optional[int] = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
     num_ctas: int = 1,  # TODO(giorgioa): Add support for dimensions tuple.
-    compute_capability: Optional[int] = None,
+    compute_capability: int | None = None,
     enable_fp_fusion: bool = True,
-    input_output_aliases: Optional[Dict[int, int]] = None,
-    zeroed_outputs: Union[
-        Sequence[int], Callable[[Dict[str, Any]], Sequence[int]]
-    ] = (),
+    input_output_aliases: dict[int, int] | None = None,
+    zeroed_outputs: (
+        Sequence[int] | Callable[[dict[str, Any]], Sequence[int]]
+    ) = (),
     debug: bool = False,
     serialized_metadata: bytes = b"",
     **metaparams: Any,

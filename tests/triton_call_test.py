@@ -263,6 +263,26 @@ class TritonKernelCallTest(parameterized.TestCase):
     x = jnp.array([1.0])
     np.testing.assert_allclose(add_scalar(x, scalar), x + scalar)
 
+  def test_explicit_compute_capability(self):
+    scalar = np.float32(8)
+
+    @triton.jit
+    def add_scalar_kernel(x_ptr, y, output_ptr):
+      tl.store(output_ptr, tl.load(x_ptr) + y)
+
+    def add_scalar(x, y):
+      return jt.triton_call(
+          x,
+          y,
+          kernel=add_scalar_kernel,
+          compute_capability=jt.get_compute_capability(0),
+          out_shape=jax.ShapeDtypeStruct((), x.dtype),
+          grid=1,
+      )
+
+    x = jnp.array([1.0])
+    np.testing.assert_allclose(add_scalar(x, scalar), x + scalar)
+
   def test_input_output_aliasing(self):
     @triton.jit
     def add_inplace_kernel(_, n_elements, output_ptr, BLOCK_SIZE: tl.constexpr):
@@ -328,16 +348,16 @@ class TritonKernelCallTest(parameterized.TestCase):
     x1, y1 = create_random_inputs([42])
     x2, y2 = create_random_inputs([43])
 
-    compile_ttir_to_ptx_inplace = jt.triton_lib.compile_ttir_to_ptx_inplace
+    compile_ttir_inplace = jt.triton_lib.compile_ttir_inplace
 
     call_count = [0]
 
     def my_compile(*args, **kwargs):
       call_count[0] += 1
-      return compile_ttir_to_ptx_inplace(*args, **kwargs)
+      return compile_ttir_inplace(*args, **kwargs)
 
     with mock.patch.object(
-        jt.triton_lib, "compile_ttir_to_ptx_inplace", new=my_compile
+        jt.triton_lib, "compile_ttir_inplace", new=my_compile
     ):
       _ = fn1(x1, y1)
       self.assertEqual(call_count[0], 1)
@@ -544,10 +564,10 @@ class TritonKernelCallTest(parameterized.TestCase):
     # Pointers are assumed to divide by 16, as do `M`, `N`, `stride_{bk,cm}`.
     # However, we've marked `a_ptr`, `M`, `stride_bk`, and `c_ptr` as "do not
     # specialize", leaving `b_ptr`, `N`, and `stride_cm`.
-    self.assertEqual(specialization.attrs.divisible_by_16, (1, 3, 9))
+    self.assertEqual(specialization.attrs.divisibility_16, [1, 3, 9])
     # `stride_{ak,bn,cn}` equal 1, but we've marked `stride_ak` as "do not
     # specialize" leaving `stride_{bn,cn}`.
-    self.assertEqual(specialization.attrs.equal_to_1, (8, 10))
+    self.assertEqual(specialization.attrs.equal_to_1, [8, 10])
 
 
 if __name__ == "__main__":
